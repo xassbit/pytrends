@@ -17,7 +17,21 @@ class TrendReq(object):
     Google Trends API
     """
 
-    def __init__(self, google_username, google_password, hl='en-US', tz=360, geo='', custom_useragent=None):
+    GET_METHOD = 'get'
+    POST_METHOD = 'post'
+
+    LOGIN_URL = 'https://accounts.google.com/ServiceLogin'
+    AUTH_URL = 'https://accounts.google.com/ServiceLoginAuth'
+
+    GENERAL_URL = 'https://www.google.com/trends/api/explore'
+    INTEREST_OVER_TIME_URL = 'https://www.google.com/trends/api/widgetdata/multiline'
+    INTEREST_BY_REGION_URL = 'https://www.google.com/trends/api/widgetdata/comparedgeo'
+    RELATED_QUERIES_URL = 'https://www.google.com/trends/api/widgetdata/relatedsearches'
+    TRENDING_SEARCHES_URL = 'https://trends.google.com/trends/hottrends/hotItems'
+    TOP_CHARTS_URL = 'https://trends.google.com/trends/topcharts/chart'
+    SUGGESTIONS_URL = 'https://www.google.com/trends/api/autocomplete/'
+
+    def __init__(self, google_username, google_password, hl='en-US', tz=360, geo='', custom_useragent='PyTrends'):
         """
         Initialize hard-coded URLs, HTTP headers, and login parameters
         needed to connect to Google Trends, then connect.
@@ -26,20 +40,15 @@ class TrendReq(object):
         self.password = google_password
         # google rate limit
         self.google_rl = 'You have reached your quota limit. Please try again later.'
-        self.url_login = "https://accounts.google.com/ServiceLogin"
-        self.url_auth = "https://accounts.google.com/ServiceLoginAuth"
         # custom user agent so users know what "new account signin for Google" is
-        if custom_useragent is None:
-            self.custom_useragent = {'User-Agent': 'PyTrends'}
-        else:
-            self.custom_useragent = {'User-Agent': custom_useragent}
+        self.custom_useragent = {'User-Agent': custom_useragent}
         self._connect()
         self.results = None
 
         # set user defined options used globally
         self.tz = tz
         self.hl = hl
-        self.geo = ''
+        self.geo = geo
         self.kw_list = list()
 
         # intialize widget payloads
@@ -54,8 +63,8 @@ class TrendReq(object):
         http://stackoverflow.com/questions/6754709/logging-in-to-google-using-python
         """
         self.ses = requests.session()
-        login_html = self.ses.get(self.url_login, headers=self.custom_useragent)
-        soup_login = BeautifulSoup(login_html.content, "lxml").find('form').find_all('input')
+        login_html = self.ses.get(TrendReq.LOGIN_URL, headers=self.custom_useragent)
+        soup_login = BeautifulSoup(login_html.content, 'lxml').find('form').find_all('input')
         form_data = dict()
         for u in soup_login:
             if u.has_attr('value') and u.has_attr('name'):
@@ -63,17 +72,43 @@ class TrendReq(object):
         # override the inputs with out login and pwd:
         form_data['Email'] = self.username
         form_data['Passwd'] = self.password
-        self.ses.post(self.url_auth, data=form_data)
+        self.ses.post(TrendReq.AUTH_URL, data=form_data)
+
+    def _get_data(self, url, method=GET_METHOD, trim_chars=0, **kwargs):
+        # make request
+        if method == TrendReq.POST_METHOD:
+            response = self.ses.post(url, **kwargs)
+        else:
+            response = self.ses.get(url, **kwargs)
+
+        # check if the response contains json and throw an exception otherwise
+        if 'application/json' in response.headers['Content-Type']:
+            # trim initial characters
+            # some responses start with garbage characters, like ")]}',"
+            # these have to be cleaned before being passed to the json parser
+            content = response.text[trim_chars:]
+
+            # parse json
+            return json.loads(content)
+        else:
+            # this is often the case when the amount of keywords in the payload for the IP
+            # is not allowed by Google
+            raise exceptions.ResponseError(
+                'The request failed: Google returned a response with code {0}.'.format(response.status_code),
+                response=response
+            )
 
     def build_payload(self, kw_list, cat=0, timeframe='today 5-y', geo='', gprop=''):
         """Create the payload for related queries, interest over time and interest by region"""
-        token_payload = dict()
         self.kw_list = kw_list
         self.geo = geo
-        token_payload['hl'] = self.hl
-        token_payload['tz'] = self.tz
-        token_payload['req'] = {'comparisonItem': [], 'category': cat}
-        token_payload['property'] = gprop
+        token_payload = {
+            'hl': self.hl,
+            'tz': self.tz,
+            'req': {'comparisonItem': [], 'category': cat},
+            'property': gprop,
+        }
+
         # build out json for each keyword
         for kw in self.kw_list:
             keyword_payload = {'keyword': kw, 'time': timeframe, 'geo': self.geo}
@@ -87,55 +122,48 @@ class TrendReq(object):
     def _tokens(self, token_payload):
         """Makes request to Google to get API tokens for interest over time, interest by region and related queries"""
 
-        # make the request
-        req_url = "https://www.google.com/trends/api/explore"
-        req = self.ses.get(req_url, params=token_payload)
+        # make the request and parse the returned json
+        widget_dict = self._get_data(
+            url=TrendReq.GENERAL_URL,
+            method=TrendReq.GET_METHOD,
+            params=token_payload
+        )['widgets']
 
-        # check if the response contains json and throw an exception otherwise
-        if 'application/json' in req.headers['Content-Type']:
-            # parse the returned json
-            # strip off garbage characters that break json parser
-            widget_json = req.text[4:]
-            widget_dict = json.loads(widget_json)['widgets']
-            # order of the json matters...
-            first_region_token = True
-            # assign requests
-            for widget in widget_dict:
-                if widget['title'] == 'Interest over time':
-                    self.interest_over_time_widget = widget
-                if widget['title'] == 'Interest by region' and first_region_token:
-                    self.interest_by_region_widget = widget
-                    first_region_token = False
-                if widget['title'] == 'Interest by subregion' and first_region_token:
-                    self.interest_by_region_widget = widget
-                    first_region_token = False
-                # response for each term, put into a list
-                if widget['title'] == 'Related queries':
-                    self.related_queries_widget_list.append(widget)
-        else:
-            # this is often the case when the amount of keywords in the payload for the IP
-            # is not allowed by Google
-            raise exceptions.ResponseError(
-                'The request failed: Google returned a response with code {0}.'.format(req.status_code),
-                response=req
-            )
+        # order of the json matters...
+        first_region_token = True
+        # assign requests
+        for widget in widget_dict:
+            if widget['title'] == 'Interest over time':
+                self.interest_over_time_widget = widget
+            if widget['title'] == 'Interest by region' and first_region_token:
+                self.interest_by_region_widget = widget
+                first_region_token = False
+            if widget['title'] == 'Interest by subregion' and first_region_token:
+                self.interest_by_region_widget = widget
+                first_region_token = False
+            # response for each term, put into a list
+            if widget['title'] == 'Related queries':
+                self.related_queries_widget_list.append(widget)
         return
 
     def interest_over_time(self):
         """Request data from Google's Interest Over Time section and return a dataframe"""
 
-        # make the request
-        req_url = "https://www.google.com/trends/api/widgetdata/multiline"
-        over_time_payload = dict()
-        # convert to string as requests will mangle
-        over_time_payload['req'] = json.dumps(self.interest_over_time_widget['request'])
-        over_time_payload['token'] = self.interest_over_time_widget['token']
-        over_time_payload['tz'] = self.tz
-        req = self.ses.get(req_url, params=over_time_payload)
+        over_time_payload = {
+            # convert to string as requests will mangle
+            'req': json.dumps(self.interest_over_time_widget['request']),
+            'token': self.interest_over_time_widget['token'],
+            'tz': self.tz
+        }
 
-        # parse the returned json
-        # strip off garbage characters that break json parser
-        req_json = json.loads(req.text[5:])
+        # make the request and parse the returned json
+        req_json = self._get_data(
+            url=TrendReq.INTEREST_OVER_TIME_URL,
+            method=TrendReq.GET_METHOD,
+            trim_chars=5,
+            params=over_time_payload,
+        )
+
         df = pd.DataFrame(req_json['default']['timelineData'])
         df['date'] = pd.to_datetime(df['time'], unit='s')
         df = df.set_index(['date']).sort_index()
@@ -151,7 +179,6 @@ class TrendReq(object):
         """Request data from Google's Interest by Region section and return a dataframe"""
 
         # make the request
-        req_url = "https://www.google.com/trends/api/widgetdata/comparedgeo"
         region_payload = dict()
         if self.geo == '':
             self.interest_by_region_widget['request']['resolution'] = resolution
@@ -159,11 +186,14 @@ class TrendReq(object):
         region_payload['req'] = json.dumps(self.interest_by_region_widget['request'])
         region_payload['token'] = self.interest_by_region_widget['token']
         region_payload['tz'] = self.tz
-        req = self.ses.get(req_url, params=region_payload)
 
         # parse returned json
-        # strip off garbage characters that break json parser
-        req_json = json.loads(req.text[5:])
+        req_json = self._get_data(
+            url=TrendReq.INTEREST_BY_REGION_URL,
+            method=TrendReq.GET_METHOD,
+            trim_chars=5,
+            params=region_payload
+        )
         df = pd.DataFrame(req_json['default']['geoMapData'])
         # rename the column with the search keyword
         df = df[['geoName', 'value']].set_index(['geoName']).sort_index()
@@ -182,7 +212,6 @@ class TrendReq(object):
         """
 
         # make the request
-        req_url = "https://www.google.com/trends/api/widgetdata/relatedsearches"
         related_payload = dict()
         result_dict = dict()
         for request_json in self.related_queries_widget_list:
@@ -192,11 +221,14 @@ class TrendReq(object):
             related_payload['req'] = json.dumps(request_json['request'])
             related_payload['token'] = request_json['token']
             related_payload['tz'] = self.tz
-            req = self.ses.get(req_url, params=related_payload)
 
             # parse the returned json
-            # strip off garbage characters that break json parser
-            req_json = json.loads(req.text[5:])
+            req_json = self._get_data(
+                url=TrendReq.RELATED_QUERIES_URL,
+                method=TrendReq.GET_METHOD,
+                trim_chars=5,
+                params=related_payload,
+            )
 
             # top queries
             try:
@@ -221,15 +253,17 @@ class TrendReq(object):
         """Request data from Google's Trending Searches section and return a dataframe"""
 
         # make the request
-        req_url = "https://trends.google.com/trends/hottrends/hotItems"
         forms = {'ajax': 1, 'pn': 'p1', 'htd': '', 'htv': 'l'}
-        req = self.ses.post(req_url, data=forms)
-        req_json = json.loads(req.text)['trendsByDateList']
+        req_json = self._get_data(
+            url=TrendReq.TRENDING_SEARCHES_URL,
+            method=TrendReq.POST_METHOD,
+            data=forms,
+        )['trendsByDateList']
         result_df = pd.DataFrame()
 
         # parse the returned json
+        sub_df = pd.DataFrame()
         for trenddate in req_json:
-            sub_df = pd.DataFrame()
             sub_df['date'] = trenddate['date']
             for trend in trenddate['trendsList']:
                 sub_df = sub_df.append(trend, ignore_index=True)
@@ -239,18 +273,15 @@ class TrendReq(object):
     def top_charts(self, date, cid, geo='US', cat=''):
         """Request data from Google's Top Charts section and return a dataframe"""
 
-        # make the request
         # create the payload
-        chart_payload = {'ajax': 1, 'lp': 1}
-        chart_payload['geo'] = geo
-        chart_payload['date'] = date
-        chart_payload['cat'] = cat
-        chart_payload['cid'] = cid
-        req_url = "https://trends.google.com/trends/topcharts/chart"
-        req = self.ses.post(req_url, params=chart_payload)
+        chart_payload = {'ajax': 1, 'lp': 1, 'geo': geo, 'date': date, 'cat': cat, 'cid': cid}
 
-        # parse the returned json
-        req_json = json.loads(req.text)['data']['entityList']
+        # make the request and parse the returned json
+        req_json = self._get_data(
+            url=TrendReq.TOP_CHARTS_URL,
+            method=TrendReq.POST_METHOD,
+            params=chart_payload,
+        )['data']['entityList']
         df = pd.DataFrame(req_json)
         return df
 
@@ -259,9 +290,10 @@ class TrendReq(object):
 
         # make the request
         kw_param = quote(keyword)
-        req = self.ses.get("https://www.google.com/trends/api/autocomplete/" + kw_param)
 
-        # parse the returned json
-        # response is invalid json but if you strip off ")]}'," from the front it is then valid
-        req_json = json.loads(req.text[5:])['default']['topics']
+        req_json = self._get_data(
+            url=TrendReq.SUGGESTIONS_URL + kw_param,
+            method=TrendReq.GET_METHOD,
+            trim_chars=5
+        )['default']['topics']
         return req_json
